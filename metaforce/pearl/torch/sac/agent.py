@@ -138,7 +138,6 @@ class PEARLAgent(nn.Module):
 
     def sample_z(self):
         if self.use_ib:
-            # TODO: why need a list???
             posteriors = [torch.distributions.Normal(m, torch.sqrt(s)) for m, s in zip(torch.unbind(self.z_means), torch.unbind(self.z_vars))]
             z = [d.rsample() for d in posteriors]
             self.z = torch.stack(z)
@@ -185,7 +184,3 @@ class PEARLAgent(nn.Module):
     @property
     def networks(self):
         return [self.context_encoder, self.policy]
-
-
-
-

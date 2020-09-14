@@ -149,8 +149,8 @@ class PEARLSoftActorCritic(MetaRLAlgorithm):
 
     ##### Training #####
     def _do_training(self, indices):
-        mb_size = self.embedding_mini_batch_size    # 256
-        num_updates = self.embedding_batch_size // mb_size  # 256
+        mb_size = self.embedding_mini_batch_size
+        num_updates = self.embedding_batch_size // mb_size
 
         # sample context batch
         context_batch = self.sample_context(indices)

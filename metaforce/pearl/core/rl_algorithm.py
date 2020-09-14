@@ -9,7 +9,9 @@ from metaforce.pearl.core import logger, eval_util
 from metaforce.pearl.data_management.env_replay_buffer import MultiTaskReplayBuffer
 from metaforce.pearl.data_management.path_builder import PathBuilder
 from metaforce.pearl.samplers.in_place import InPlacePathSampler
+from metaforce.pearl.torch.sac.policies import MakeDeterministic
 from metaforce.pearl.torch import pytorch_util as ptu
+from metaforce.eval import meta_test
 
 from ray.tune import report
 
@@ -142,7 +144,7 @@ class MetaRLAlgorithm(metaclass=abc.ABCMeta):
         '''
         meta-training loop
         '''
-        self.pretrain()     # pass
+        self.pretrain()
         params = self.get_epoch_snapshot(-1)
         logger.save_itr_params(-1, params)
         gt.reset()
@@ -150,7 +152,7 @@ class MetaRLAlgorithm(metaclass=abc.ABCMeta):
         self._current_path_builder = PathBuilder()
 
         # at each iteration, we first collect data from tasks, perform meta-updates, then try to evaluate
-        for it_ in gt.timed_for(    # TODO: add gtimer??? I dont like it
+        for it_ in gt.timed_for(
                 range(self.num_iterations),
                 save_itrs=True,
         ):
@@ -170,18 +172,18 @@ class MetaRLAlgorithm(metaclass=abc.ABCMeta):
                 self.env.reset_task(idx)
                 self.enc_replay_buffer.task_buffers[idx].clear()
 
-                # collect some trajectories with z ~ prior. depends on env, can be 400 or 1000
+                # collect some trajectories with z ~ prior.
                 if self.num_steps_prior > 0:
-                    self.collect_data(self.num_steps_prior, 1, np.inf)  # return a whole traj
-                # collect some trajectories with z ~ posterior. depends on env, usually 0
+                    self.collect_data(self.num_steps_prior, 1, np.inf)
+                # collect some trajectories with z ~ posterior.
                 if self.num_steps_posterior > 0:
                     self.collect_data(self.num_steps_posterior, 1, self.update_post_train)
                 # even if encoder is trained only on samples from the prior, the policy needs to learn to handle z ~ posterior
-                if self.num_extra_rl_steps_posterior > 0:   # depends. can be 400, 600, 1000
+                if self.num_extra_rl_steps_posterior > 0:
                     self.collect_data(self.num_extra_rl_steps_posterior, 1, self.update_post_train, add_to_enc_buffer=False)
 
             # Sample train tasks and compute gradient updates on parameters.
-            for train_step in range(self.num_train_steps_per_itr):  # usually 4000
+            for train_step in range(self.num_train_steps_per_itr):
                 indices = np.random.choice(self.train_tasks, self.meta_batch)
                 self._do_training(indices)
                 self._n_train_steps_total += 1
@@ -202,7 +204,6 @@ class MetaRLAlgorithm(metaclass=abc.ABCMeta):
         pass
 
     def collect_data(self, num_samples, resample_z_rate, update_posterior_rate, add_to_enc_buffer=True):
-        # TODO: why call it update_posterior_rate???
         '''
         get trajectories from current env in batch mode with given policy
         collect complete trajectories until the number of collected transitions >= num_samples
@@ -347,132 +348,6 @@ class MetaRLAlgorithm(metaclass=abc.ABCMeta):
             data_to_save['algorithm'] = self
         return data_to_save
 
-    def collect_paths(self, idx, epoch, run):
-        self.task_idx = idx
-        self.env.reset_task(idx)
-
-        self.agent.clear_z()
-        paths = []
-        num_transitions = 0
-        num_trajs = 0
-        while num_transitions < self.num_steps_per_eval:
-            path, num = self.sampler.obtain_samples(deterministic=self.eval_deterministic, max_samples=self.num_steps_per_eval - num_transitions, max_trajs=1, accum_context=True)
-            paths += path
-            num_transitions += num
-            num_trajs += 1
-            if num_trajs >= self.num_exp_traj_eval:
-                self.agent.infer_posterior(self.agent.context)
-
-        if self.sparse_rewards:
-            for p in paths:
-                sparse_rewards = np.stack(e['sparse_reward'] for e in p['env_infos']).reshape(-1, 1)
-                p['rewards'] = sparse_rewards
-
-        goal = self.env._goal
-        for path in paths:
-            path['goal'] = goal # goal
-
-        # save the paths for visualization, only useful for point mass
-        if self.dump_eval_paths:
-            logger.save_extra_data(paths, path='eval_trajectories/task{}-epoch{}-run{}'.format(idx, epoch, run))
-
-        return paths
-
-    def _do_eval(self, indices, epoch):
-        final_returns = []
-        online_returns = []
-        for idx in indices:
-            all_rets = []
-            for r in range(self.num_evals):
-                paths = self.collect_paths(idx, epoch, r)
-                all_rets.append([eval_util.get_average_returns([p]) for p in paths])
-            final_returns.append(np.mean([a[-1] for a in all_rets]))
-            # record online returns for the first n trajectories
-            n = min([len(a) for a in all_rets])
-            all_rets = [a[:n] for a in all_rets]
-            all_rets = np.mean(np.stack(all_rets), axis=0) # avg return per nth rollout
-            online_returns.append(all_rets)
-        n = min([len(t) for t in online_returns])
-        online_returns = [t[:n] for t in online_returns]
-        return final_returns, online_returns
-
-    def evaluate(self, epoch):
-        if self.eval_statistics is None:
-            self.eval_statistics = OrderedDict()
-
-        ### sample trajectories from prior for debugging / visualization
-        if self.dump_eval_paths:
-            # 100 arbitrarily chosen for visualizations of point_robot trajectories
-            # just want stochasticity of z, not the policy
-            self.agent.clear_z()
-            prior_paths, _ = self.sampler.obtain_samples(deterministic=self.eval_deterministic, max_samples=self.max_path_length * 20,
-                                                        accum_context=False,
-                                                        resample=1)
-            logger.save_extra_data(prior_paths, path='eval_trajectories/prior-epoch{}'.format(epoch))
-
-        ### train tasks
-        # eval on a subset of train tasks for speed
-        indices = np.random.choice(self.train_tasks, len(self.eval_tasks))
-        eval_util.dprint('evaluating on {} train tasks'.format(len(indices)))
-        ### eval train tasks with posterior sampled from the training replay buffer
-        train_returns = []
-        for idx in indices:
-            self.task_idx = idx
-            self.env.reset_task(idx)
-            paths = []
-            for _ in range(self.num_steps_per_eval // self.max_path_length):
-                context = self.sample_context(idx)
-                self.agent.infer_posterior(context)
-                p, _ = self.sampler.obtain_samples(deterministic=self.eval_deterministic, max_samples=self.max_path_length,
-                                                        accum_context=False,
-                                                        max_trajs=1,
-                                                        resample=np.inf)
-                paths += p
-
-            if self.sparse_rewards:
-                for p in paths:
-                    sparse_rewards = np.stack(e['sparse_reward'] for e in p['env_infos']).reshape(-1, 1)
-                    p['rewards'] = sparse_rewards
-
-            train_returns.append(eval_util.get_average_returns(paths))
-        train_returns = np.mean(train_returns)
-        ### eval train tasks with on-policy data to match eval of test tasks
-        train_final_returns, train_online_returns = self._do_eval(indices, epoch)
-        eval_util.dprint('train online returns')
-        eval_util.dprint(train_online_returns)
-
-        ### test tasks
-        eval_util.dprint('evaluating on {} test tasks'.format(len(self.eval_tasks)))
-        test_final_returns, test_online_returns = self._do_eval(self.eval_tasks, epoch)
-        eval_util.dprint('test online returns')
-        eval_util.dprint(test_online_returns)
-
-        # save the final posterior
-        self.agent.log_diagnostics(self.eval_statistics)
-
-        if hasattr(self.env, "log_diagnostics"):
-            self.env.log_diagnostics(paths, prefix=None)
-
-        avg_train_return = np.mean(train_final_returns)
-        avg_test_return = np.mean(test_final_returns)
-        avg_train_online_return = np.mean(np.stack(train_online_returns), axis=0)
-        avg_test_online_return = np.mean(np.stack(test_online_returns), axis=0)
-        self.eval_statistics['AverageTrainReturn_all_train_tasks'] = train_returns
-        self.eval_statistics['AverageReturn_all_train_tasks'] = avg_train_return
-        self.eval_statistics['AverageReturn_all_test_tasks'] = avg_test_return
-        logger.save_extra_data(avg_train_online_return, path='online-train-epoch{}'.format(epoch))
-        logger.save_extra_data(avg_test_online_return, path='online-test-epoch{}'.format(epoch))
-
-        for key, value in self.eval_statistics.items():
-            logger.record_tabular(key, value)
-        self.eval_statistics = None
-
-        if self.render_eval_paths:
-            self.env.render_paths(paths)
-
-        if self.plotter:
-            self.plotter.draw()
-
     @abc.abstractmethod
     def training_mode(self, mode):
         """
@@ -490,3 +365,73 @@ class MetaRLAlgorithm(metaclass=abc.ABCMeta):
         """
         pass
 
+    def _do_eval(self, agent, indices, epoch):
+        final_returns = []
+        online_returns = []
+        for idx in indices:
+            all_rets = []
+            for r in range(self.num_evals):
+                paths, _ = meta_test(self.env, idx, agent, self.max_path_length, max_samples=self.num_steps_per_eval)
+                all_rets.append([eval_util.get_average_returns([p]) for p in paths])
+            final_returns.append(np.mean([a[-1] for a in all_rets]))
+            # record online returns for the first n trajectories
+            n = min([len(a) for a in all_rets])
+            all_rets = [a[:n] for a in all_rets]
+            all_rets = np.mean(np.stack(all_rets), axis=0) # avg return per nth rollout
+            online_returns.append(all_rets)
+        n = min([len(t) for t in online_returns])
+        online_returns = [t[:n] for t in online_returns]
+        return final_returns, online_returns
+
+    def evaluate(self, epoch):
+        if self.eval_statistics is None:
+            self.eval_statistics = OrderedDict()
+        eval_agent = MakeDeterministic(self.agent) if self.eval_deterministic else self.agent
+
+        # eval on a subset of train tasks for speed
+        indices = np.random.choice(self.train_tasks, len(self.eval_tasks))
+        eval_util.dprint('evaluating on {} train tasks'.format(len(indices)))
+
+        ### eval train tasks with posterior sampled from the training replay buffer
+        train_returns = []
+        for idx in indices:
+            for _ in range(self.num_steps_per_eval // self.max_path_length):
+                p, eval_return = meta_test(self.env, idx, eval_agent, 
+                                        max_path_length=self.max_path_length, 
+                                        max_samples=self.max_path_length, max_trajs=1, sample_context=self.sample_context, off_policy=True)
+            train_returns.append(eval_return)
+        train_returns = np.mean(train_returns)
+        
+        ### eval train tasks with on-policy data to match eval of test tasks
+        train_final_returns, train_online_returns = self._do_eval(eval_agent, indices, epoch)
+        eval_util.dprint('train online returns')
+        eval_util.dprint(train_online_returns)
+
+        ### test tasks
+        eval_util.dprint('evaluating on {} test tasks'.format(len(self.eval_tasks)))
+        test_final_returns, test_online_returns = self._do_eval(eval_agent, self.eval_tasks, epoch)
+        eval_util.dprint('test online returns')
+        eval_util.dprint(test_online_returns)
+
+        # save the final posterior
+        self.agent.log_diagnostics(self.eval_statistics)
+
+        avg_train_return = np.mean(train_final_returns)
+        avg_test_return = np.mean(test_final_returns)
+        avg_train_online_return = np.mean(np.stack(train_online_returns), axis=0)
+        avg_test_online_return = np.mean(np.stack(test_online_returns), axis=0)
+        self.eval_statistics['AverageTrainReturn_all_train_tasks'] = train_returns
+        self.eval_statistics['AverageReturn_all_train_tasks'] = avg_train_return
+        self.eval_statistics['AverageReturn_all_test_tasks'] = avg_test_return
+        logger.save_extra_data(avg_train_online_return, path='online-train-epoch{}'.format(epoch))
+        logger.save_extra_data(avg_test_online_return, path='online-test-epoch{}'.format(epoch))
+
+        for key, value in self.eval_statistics.items():
+            logger.record_tabular(key, value)
+        self.eval_statistics = None
+
+        # if self.render_eval_paths:
+        #     self.env.render_paths(paths)
+
+        if self.plotter:
+            self.plotter.draw()
