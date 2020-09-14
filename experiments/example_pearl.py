@@ -4,7 +4,7 @@ from ray import tune
 
 """
 Example:
-    python example_pearl.py --experiment pearl --num-gpus 0 --env ant-dir --test-mode --num-seeds 1
+    python example_pearl.py --exp-name pearl --num-gpus 0 --env ant-dir --test-mode --num-seeds 1
 """
 
 if __name__ == '__main__':
