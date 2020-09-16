@@ -79,7 +79,6 @@ def meta_test(
     max_samples=np.inf,
     max_trajs=np.inf,
     sparse_rewards=False, 
-    sample_context=None,
     off_policy=False,
     num_exp_traj_eval=None,
     ):
@@ -89,13 +88,6 @@ def meta_test(
     env.reset_task(idx)
     paths = []
     
-    if off_policy:
-        assert sample_context is not None
-        context = sample_context(idx)
-        agent.infer_posterior(context)
-    else:
-        agent.clear_z()
-
     n_steps_total = 0
     n_trajs = 0
     while n_steps_total < max_samples and n_trajs < max_trajs:
@@ -106,6 +98,8 @@ def meta_test(
         n_steps_total += len(path['observations'])
         n_trajs += 1
         paths.append(path)
+
+        # in PEARL, update context variable in on-policy test
         if num_exp_traj_eval is not None and n_trajs >= num_exp_traj_eval:
             agent.infer_posterior(agent.context)
 

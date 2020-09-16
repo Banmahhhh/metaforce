@@ -371,7 +371,9 @@ class MetaRLAlgorithm(metaclass=abc.ABCMeta):
         for idx in indices:
             all_rets = []
             for r in range(self.num_evals):
-                paths, _ = meta_test(self.env, idx, agent, self.max_path_length, max_samples=self.num_steps_per_eval)
+                self.agent.clear_z()
+                paths, _ = meta_test(self.env, idx, agent, self.max_path_length, 
+                                     max_samples=self.num_steps_per_eval, num_exp_traj_eval=self.num_exp_traj_eval)
                 all_rets.append([eval_util.get_average_returns([p]) for p in paths])
             final_returns.append(np.mean([a[-1] for a in all_rets]))
             # record online returns for the first n trajectories
@@ -395,10 +397,12 @@ class MetaRLAlgorithm(metaclass=abc.ABCMeta):
         ### eval train tasks with posterior sampled from the training replay buffer
         train_returns = []
         for idx in indices:
+            context = self.sample_context(idx)
+            self.agent.infer_posterior(context)
             for _ in range(self.num_steps_per_eval // self.max_path_length):
                 p, eval_return = meta_test(self.env, idx, eval_agent, 
                                         max_path_length=self.max_path_length, 
-                                        max_samples=self.max_path_length, max_trajs=1, sample_context=self.sample_context, off_policy=True)
+                                        max_samples=self.max_path_length, max_trajs=1, off_policy=True)
             train_returns.append(eval_return)
         train_returns = np.mean(train_returns)
         
